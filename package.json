@@ -1,0 +1,8 @@
+{
+    "name": "valye-renderer",
+    "type": "module",
+    "dependencies": {
+          "express": "^4.19.2",
+          "playwright": "^1.46.0"
+    }
+}      
