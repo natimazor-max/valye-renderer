@@ -1,8 +1,9 @@
 {
-    "name": "valye-renderer",
-    "type": "module",
-    "dependencies": {
-          "express": "^4.19.2",
-          "playwright": "1.57.0"
-    }
-}      
+  "name": "valye-renderer",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "1.57.0",
+    "qrcode": "^1.5.4"
+  }
+}
