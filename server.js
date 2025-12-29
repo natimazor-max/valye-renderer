@@ -10,8 +10,6 @@ app.get("/health", (_, res) => res.send("ok"));
 
 app.post("/render", async (req, res) => {
   const t0 = Date.now();
-
-  let browser;
   try {
     const provided = req.header("x-render-secret") || "";
     if (!SECRET || provided !== SECRET) return res.status(401).send("Unauthorized");
@@ -20,18 +18,18 @@ app.post("/render", async (req, res) => {
     if (!html || !format) return res.status(400).send("Missing html/format");
     if (!["pdf", "png"].includes(format)) return res.status(400).send("format must be pdf|png");
 
-    // PNG options (honor width/height for “share-safe crops”)
-    const pngWidth = Number(png?.width) || 1280;
-    const pngHeight = Number(png?.height) || 720;
-    const deviceScaleFactor = Number(png?.deviceScaleFactor) || 2;
-    const fullPage = png?.fullPage === true; // default false for exact canvas captures
+    // Defaults
+    const width = Number(png?.width ?? 1280);
+    const height = Number(png?.height ?? 720);
+    const deviceScaleFactor = Number(png?.deviceScaleFactor ?? 2);
+    const fullPage = Boolean(png?.fullPage ?? false);
 
-    browser = await chromium.launch({
+    const browser = await chromium.launch({
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
     const page = await browser.newPage({
-      viewport: { width: pngWidth, height: pngHeight },
+      viewport: { width, height },
       deviceScaleFactor,
     });
 
@@ -44,32 +42,36 @@ app.post("/render", async (req, res) => {
       return route.continue();
     });
 
-    // DO NOT use networkidle
     await page.setContent(html, { waitUntil: "domcontentloaded", timeout: 30_000 });
 
-    // Give images a moment to load (logo + QR)
-    await page.waitForFunction(() => {
-      const imgs = Array.from(document.images || []);
-      return imgs.every((img) => img.complete);
-    }, { timeout: 3500 }).catch(() => {});
+    // Give images (logo gif + QR) a moment to load, without using networkidle
+    try {
+      await page.waitForFunction(() => {
+        const imgs = Array.from(document.images || []);
+        return imgs.every((img) => img.complete);
+      }, { timeout: 2000 });
+    } catch {
+      // ok to proceed; screenshot will still work
+    }
     await page.waitForTimeout(150);
 
     let buffer;
     if (format === "pdf") {
       buffer = await page.pdf({
-        format: pdf?.format || "A4",
+        format: pdf?.format ?? "A4",
         printBackground: true,
-        margin: pdf?.margin || { top: "12mm", bottom: "12mm", left: "12mm", right: "12mm" },
+        margin: pdf?.margin ?? { top: "12mm", bottom: "12mm", left: "12mm", right: "12mm" },
       });
     } else {
       buffer = await page.screenshot({
         type: "png",
-        fullPage, // for “share crops” we want false (viewport-only)
+        fullPage,
+        // Force exact size capture for share formats
+        clip: fullPage ? undefined : { x: 0, y: 0, width, height },
       });
     }
 
     await browser.close();
-    browser = null;
 
     console.log(`[render] ${format} ok in ${Date.now() - t0}ms, bytes=${buffer.length}`);
 
@@ -79,7 +81,6 @@ app.post("/render", async (req, res) => {
     });
   } catch (e) {
     console.error("[render] error", e);
-    try { if (browser) await browser.close(); } catch {}
     res.status(500).send(String(e?.message ?? e));
   }
 });
