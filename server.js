@@ -1,6 +1,5 @@
 import express from "express";
 import { chromium } from "playwright";
-import QRCode from "qrcode";
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
@@ -11,48 +10,32 @@ app.get("/health", (_, res) => res.send("ok"));
 
 app.post("/render", async (req, res) => {
   const t0 = Date.now();
+
+  let browser;
   try {
     const provided = req.header("x-render-secret") || "";
     if (!SECRET || provided !== SECRET) return res.status(401).send("Unauthorized");
 
-    const { format, html, viewport, screenshot, qr } = req.body || {};
+    const { format, html, png, pdf } = req.body || {};
     if (!html || !format) return res.status(400).send("Missing html/format");
     if (!["pdf", "png"].includes(format)) return res.status(400).send("format must be pdf|png");
 
-    // Optional QR: generate data URI here (no canvas needed)
-    let finalHtml = String(html);
-    if (qr?.text) {
-      const size = Number(qr?.size ?? 92);
-      const dataUrl = await QRCode.toDataURL(String(qr.text), {
-        width: size,
-        margin: 0,
-        errorCorrectionLevel: "M",
-      });
-      finalHtml = finalHtml.replaceAll("__VALYE_QR_DATA_URI__", dataUrl);
-    } else {
-      // fallback: 1x1 transparent png
-      finalHtml = finalHtml.replaceAll(
-        "__VALYE_QR_DATA_URI__",
-        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/6r2nqkAAAAASUVORK5CYII=",
-      );
-    }
+    // PNG options (honor width/height for “share-safe crops”)
+    const pngWidth = Number(png?.width) || 1280;
+    const pngHeight = Number(png?.height) || 720;
+    const deviceScaleFactor = Number(png?.deviceScaleFactor) || 2;
+    const fullPage = png?.fullPage === true; // default false for exact canvas captures
 
-    const vp = {
-      width: Math.max(320, Math.min(4000, Number(viewport?.width ?? 1280))),
-      height: Math.max(320, Math.min(6000, Number(viewport?.height ?? 720))),
-      deviceScaleFactor: Math.max(1, Math.min(3, Number(viewport?.dpr ?? 1))),
-    };
-
-    const browser = await chromium.launch({
+    browser = await chromium.launch({
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
     const page = await browser.newPage({
-      viewport: { width: vp.width, height: vp.height },
-      deviceScaleFactor: vp.deviceScaleFactor,
+      viewport: { width: pngWidth, height: pngHeight },
+      deviceScaleFactor,
     });
 
-    // Block Google Fonts so we never hang on font fetches
+    // Block external font fetches so we never hang on Google Fonts
     await page.route("**/*", (route) => {
       const u = route.request().url();
       if (u.includes("fonts.googleapis.com") || u.includes("fonts.gstatic.com")) {
@@ -61,32 +44,32 @@ app.post("/render", async (req, res) => {
       return route.continue();
     });
 
-    await page.setContent(finalHtml, { waitUntil: "domcontentloaded", timeout: 30_000 });
-    await page.waitForTimeout(250);
+    // DO NOT use networkidle
+    await page.setContent(html, { waitUntil: "domcontentloaded", timeout: 30_000 });
+
+    // Give images a moment to load (logo + QR)
+    await page.waitForFunction(() => {
+      const imgs = Array.from(document.images || []);
+      return imgs.every((img) => img.complete);
+    }, { timeout: 3500 }).catch(() => {});
+    await page.waitForTimeout(150);
 
     let buffer;
-
     if (format === "pdf") {
       buffer = await page.pdf({
-        format: "A4",
+        format: pdf?.format || "A4",
         printBackground: true,
-        margin: { top: "12mm", bottom: "12mm", left: "12mm", right: "12mm" },
+        margin: pdf?.margin || { top: "12mm", bottom: "12mm", left: "12mm", right: "12mm" },
       });
     } else {
-      // PNG
-      const selector = screenshot?.selector;
-      if (selector) {
-        const loc = page.locator(selector);
-        const count = await loc.count();
-        if (!count) throw new Error(`screenshot selector not found: ${selector}`);
-        buffer = await loc.first().screenshot({ type: "png" });
-      } else {
-        const fullPage = screenshot?.fullPage !== false;
-        buffer = await page.screenshot({ fullPage, type: "png" });
-      }
+      buffer = await page.screenshot({
+        type: "png",
+        fullPage, // for “share crops” we want false (viewport-only)
+      });
     }
 
     await browser.close();
+    browser = null;
 
     console.log(`[render] ${format} ok in ${Date.now() - t0}ms, bytes=${buffer.length}`);
 
@@ -96,6 +79,7 @@ app.post("/render", async (req, res) => {
     });
   } catch (e) {
     console.error("[render] error", e);
+    try { if (browser) await browser.close(); } catch {}
     res.status(500).send(String(e?.message ?? e));
   }
 });
