@@ -1,5 +1,6 @@
 import express from "express";
 import { chromium } from "playwright";
+import QRCode from "qrcode";
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
@@ -10,37 +11,46 @@ app.get("/health", (_, res) => res.send("ok"));
 
 app.post("/render", async (req, res) => {
   const t0 = Date.now();
-  let browser;
   try {
     const provided = req.header("x-render-secret") || "";
     if (!SECRET || provided !== SECRET) return res.status(401).send("Unauthorized");
 
-    const {
-      format,
-      html,
-      viewport, // { width, height, deviceScaleFactor }
-      screenshotSelector, // e.g. "#canvas"
-      png, // { fullPage?: boolean }
-      pdf, // pass-through options if needed later
-    } = req.body || {};
-
+    const { format, html, viewport, screenshot, qr } = req.body || {};
     if (!html || !format) return res.status(400).send("Missing html/format");
     if (!["pdf", "png"].includes(format)) return res.status(400).send("format must be pdf|png");
 
-    const width = Number(viewport?.width ?? 1280);
-    const height = Number(viewport?.height ?? 720);
-    const dpr = Number(viewport?.deviceScaleFactor ?? 2);
+    // Optional QR: generate data URI here (no canvas needed)
+    let finalHtml = String(html);
+    if (qr?.text) {
+      const size = Number(qr?.size ?? 92);
+      const dataUrl = await QRCode.toDataURL(String(qr.text), {
+        width: size,
+        margin: 0,
+        errorCorrectionLevel: "M",
+      });
+      finalHtml = finalHtml.replaceAll("__VALYE_QR_DATA_URI__", dataUrl);
+    } else {
+      // fallback: 1x1 transparent png
+      finalHtml = finalHtml.replaceAll(
+        "__VALYE_QR_DATA_URI__",
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/6r2nqkAAAAASUVORK5CYII=",
+      );
+    }
 
-    browser = await chromium.launch({
+    const vp = {
+      width: Math.max(320, Math.min(4000, Number(viewport?.width ?? 1280))),
+      height: Math.max(320, Math.min(6000, Number(viewport?.height ?? 720))),
+      deviceScaleFactor: Math.max(1, Math.min(3, Number(viewport?.dpr ?? 1))),
+    };
+
+    const browser = await chromium.launch({
       args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const context = await browser.newContext({
-      viewport: { width, height },
-      deviceScaleFactor: dpr,
+    const page = await browser.newPage({
+      viewport: { width: vp.width, height: vp.height },
+      deviceScaleFactor: vp.deviceScaleFactor,
     });
-
-    const page = await context.newPage();
 
     // Block Google Fonts so we never hang on font fetches
     await page.route("**/*", (route) => {
@@ -51,12 +61,8 @@ app.post("/render", async (req, res) => {
       return route.continue();
     });
 
-    // DO NOT use networkidle (can hang)
-    await page.setContent(html, { waitUntil: "domcontentloaded", timeout: 30_000 });
-
-    // If your template sets this flag, we wait for it (safe if not present)
-    await page.waitForFunction(() => true, { timeout: 1_000 }).catch(() => {});
-    await page.waitForTimeout(200);
+    await page.setContent(finalHtml, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await page.waitForTimeout(250);
 
     let buffer;
 
@@ -65,26 +71,24 @@ app.post("/render", async (req, res) => {
         format: "A4",
         printBackground: true,
         margin: { top: "12mm", bottom: "12mm", left: "12mm", right: "12mm" },
-        ...(pdf || {}),
       });
     } else {
-      // PNG: best practice — screenshot the canvas element so output is EXACT size
-      if (screenshotSelector) {
-        await page.waitForSelector(screenshotSelector, { timeout: 10_000 });
-        const el = await page.$(screenshotSelector);
-        if (!el) throw new Error(`screenshotSelector not found: ${screenshotSelector}`);
-        buffer = await el.screenshot({ type: "png" });
+      // PNG
+      const selector = screenshot?.selector;
+      if (selector) {
+        const loc = page.locator(selector);
+        const count = await loc.count();
+        if (!count) throw new Error(`screenshot selector not found: ${selector}`);
+        buffer = await loc.first().screenshot({ type: "png" });
       } else {
-        buffer = await page.screenshot({ fullPage: !!png?.fullPage, type: "png" });
+        const fullPage = screenshot?.fullPage !== false;
+        buffer = await page.screenshot({ fullPage, type: "png" });
       }
     }
 
-    await context.close();
     await browser.close();
 
-    console.log(
-      `[render] ${format} ok in ${Date.now() - t0}ms, bytes=${buffer.length}, viewport=${width}x${height}@${dpr}`,
-    );
+    console.log(`[render] ${format} ok in ${Date.now() - t0}ms, bytes=${buffer.length}`);
 
     res.json({
       contentType: format === "pdf" ? "application/pdf" : "image/png",
@@ -92,9 +96,6 @@ app.post("/render", async (req, res) => {
     });
   } catch (e) {
     console.error("[render] error", e);
-    try {
-      if (browser) await browser.close();
-    } catch {}
     res.status(500).send(String(e?.message ?? e));
   }
 });
