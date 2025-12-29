@@ -6,10 +6,31 @@ app.use(express.json({ limit: "25mb" }));
 
 const SECRET = process.env.RENDERER_SECRET || "";
 
+// Tune these safely
+const SETCONTENT_TIMEOUT_MS = 30_000;
+const SCREENSHOT_TIMEOUT_MS = 120_000; // <-- fix: default is 30s; too low for big + blur
+const DEFAULT_WAIT_MS = 2_500;
+
 app.get("/health", (_, res) => res.send("ok"));
+
+async function waitForImages(page, maxMs = DEFAULT_WAIT_MS) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    const allDone = await page.evaluate(() => {
+      const imgs = Array.from(document.images || []);
+      // If there are no images, we’re done.
+      if (!imgs.length) return true;
+      return imgs.every((img) => img.complete);
+    });
+    if (allDone) return true;
+    await page.waitForTimeout(100);
+  }
+  return false;
+}
 
 app.post("/render", async (req, res) => {
   const t0 = Date.now();
+  let browser;
   try {
     const provided = req.header("x-render-secret") || "";
     if (!SECRET || provided !== SECRET) return res.status(401).send("Unauthorized");
@@ -21,11 +42,20 @@ app.post("/render", async (req, res) => {
     // Defaults
     const width = Number(png?.width ?? 1280);
     const height = Number(png?.height ?? 720);
-    const deviceScaleFactor = Number(png?.deviceScaleFactor ?? 2);
+
+    // OPTIONAL: cap deviceScaleFactor for very tall shots to avoid timeouts/CPU spikes
+    // (You can remove this if you want exact dSF always.)
+    let deviceScaleFactor = Number(png?.deviceScaleFactor ?? 2);
+    if (height >= 1600 && deviceScaleFactor > 1.5) deviceScaleFactor = 1.5;
+
     const fullPage = Boolean(png?.fullPage ?? false);
 
-    const browser = await chromium.launch({
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+    browser = await chromium.launch({
+      args: [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu", // helps on some hosts
+      ],
     });
 
     const page = await browser.newPage({
@@ -33,7 +63,10 @@ app.post("/render", async (req, res) => {
       deviceScaleFactor,
     });
 
-    // Block external font fetches so we never hang on Google Fonts
+    // Speed/stability tweaks
+    page.setDefaultTimeout(SCREENSHOT_TIMEOUT_MS);
+
+    // Block Google fonts to avoid hangs
     await page.route("**/*", (route) => {
       const u = route.request().url();
       if (u.includes("fonts.googleapis.com") || u.includes("fonts.gstatic.com")) {
@@ -42,10 +75,18 @@ app.post("/render", async (req, res) => {
       return route.continue();
     });
 
-    await page.setContent(html, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await page.setContent(html, { waitUntil: "domcontentloaded", timeout: SETCONTENT_TIMEOUT_MS });
 
-    // Give the layout a beat + wait for logo/watermark images (bounded)
-    await page.waitForTimeout(150);
+    // Disable animations/transitions (prevents “never settles” rendering edge cases)
+    await page.addStyleTag({
+      content: `
+        * { animation: none !important; transition: none !important; }
+        html { scroll-behavior: auto !important; }
+      `,
+    });
+
+    // Give the layout a beat + wait for <img> loads (bounded)
+    await page.waitForTimeout(200);
     await waitForImages(page, DEFAULT_WAIT_MS);
 
     let buffer;
@@ -54,19 +95,25 @@ app.post("/render", async (req, res) => {
         format: pdf?.format ?? "A4",
         printBackground: true,
         margin: pdf?.margin ?? { top: "12mm", bottom: "12mm", left: "12mm", right: "12mm" },
+        timeout: SCREENSHOT_TIMEOUT_MS,
       });
     } else {
       buffer = await page.screenshot({
         type: "png",
         fullPage,
-        // Force exact size capture for share formats
         clip: fullPage ? undefined : { x: 0, y: 0, width, height },
+        timeout: SCREENSHOT_TIMEOUT_MS, // <-- critical
+        animations: "disabled",
       });
     }
 
     await browser.close();
+    browser = null;
 
-    console.log(`[render] ${format} ok in ${Date.now() - t0}ms, bytes=${buffer.length}`);
+    console.log(
+      `[render] ${format} ok in ${Date.now() - t0}ms, bytes=${buffer.length}, ` +
+      `viewport=${width}x${height}, dSF=${deviceScaleFactor}, fullPage=${fullPage}`
+    );
 
     res.json({
       contentType: format === "pdf" ? "application/pdf" : "image/png",
@@ -74,6 +121,7 @@ app.post("/render", async (req, res) => {
     });
   } catch (e) {
     console.error("[render] error", e);
+    try { if (browser) await browser.close(); } catch {}
     res.status(500).send(String(e?.message ?? e));
   }
 });
