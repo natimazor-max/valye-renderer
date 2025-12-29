@@ -44,16 +44,9 @@ app.post("/render", async (req, res) => {
 
     await page.setContent(html, { waitUntil: "domcontentloaded", timeout: 30_000 });
 
-    // Give images (logo gif + QR) a moment to load, without using networkidle
-    try {
-      await page.waitForFunction(() => {
-        const imgs = Array.from(document.images || []);
-        return imgs.every((img) => img.complete);
-      }, { timeout: 2000 });
-    } catch {
-      // ok to proceed; screenshot will still work
-    }
+    // Give the layout a beat + wait for logo/watermark images (bounded)
     await page.waitForTimeout(150);
+    await waitForImages(page, DEFAULT_WAIT_MS);
 
     let buffer;
     if (format === "pdf") {
