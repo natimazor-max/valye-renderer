@@ -11,7 +11,7 @@ const DEFAULT_VIEWPORT = {
   width: Number(process.env.RENDER_DEFAULT_WIDTH || "1280"),
   height: Number(process.env.RENDER_DEFAULT_HEIGHT || "720"),
 };
-const DEFAULT_SCALE = Number(process.env.RENDER_DEVICE_SCALE || "2"); // crisp PNG
+const DEFAULT_SCALE = Number(process.env.RENDER_DEVICE_SCALE || "1"); // crisp PNG
 const DEFAULT_WAIT_MS = Number(process.env.RENDER_WAIT_MS || "2500"); // wait for images
 const NAV_TIMEOUT_MS = Number(process.env.RENDER_NAV_TIMEOUT_MS || "30000");
 
